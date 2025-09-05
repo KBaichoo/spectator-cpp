@@ -35,7 +35,7 @@ cc_test(
     ]),
     linkopts = select({
         "@bazel_tools//src/conditions:linux_x86_64": [
-            "-lbfd",
+            #"-lbfd",
             "-ldl",
         ],
         "//conditions:default": [],
@@ -46,7 +46,7 @@ cc_test(
     }),
     deps = [
         ":spectator",
-        "@com_github_bombela_backward//:backward",
+        #"@com_github_bombela_backward//:backward",
         "@com_google_googletest//:gtest",
     ],
 )

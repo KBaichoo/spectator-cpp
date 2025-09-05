@@ -1,5 +1,9 @@
 build --cxxopt='-std=c++17' --cxxopt='-Wall' --cxxopt='-fno-omit-frame-pointer'
 
+# Use clang14 compiler
+build --action_env=CC=/home/kbaichoo/opt/clang14/bin/clang
+build --action_env=CXX=/home/kbaichoo/opt/clang14/bin/clang++
+
 # Address sanitizer
 # To use it: bazel build --config asan
 build:asan --strip=never
