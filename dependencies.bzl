@@ -34,9 +34,9 @@ def spectator_dependencies():
     http_archive(
         name = "asio",
         build_file = "@spectator//third_party:asio.BUILD",
-        urls = ["https://github.com/chriskohlhoff/asio/archive/asio-1-14-0.zip"],
-        strip_prefix = "asio-asio-1-14-0",
-        sha256 = "7887c91704a92dc8425385b1ff6f3e432e8869745b2ee2f896a1e7eb2a60e729",
+        urls = ["https://github.com/chriskohlhoff/asio/archive/asio-1-18-0.zip"],
+        strip_prefix = "asio-asio-1-18-0",
+        sha256 = "4636bc9b7732a294e6cdee4dc53760d7b6e49d963c8f0120c129491056237f51",
     )
 
     http_archive(
