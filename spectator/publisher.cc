@@ -1,28 +1,45 @@
 #include "publisher.h"
 #include "logger.h"
 #include <fmt/format.h>
+#include <sched.h>
+#include <unistd.h>
 
 namespace spectator {
 
 static const char NEW_LINE = '\n';
 
-SpectatordPublisher::SpectatordPublisher(absl::string_view endpoint,
-                                         uint32_t bytes_to_buffer,
+SpectatordPublisher::SpectatordPublisher(absl::string_view endpoint, uint32_t bytes_to_buffer,
                                          std::chrono::milliseconds flush_interval,
                                          std::shared_ptr<spdlog::logger> logger)
-    : logger_(std::move(logger)),
-      udp_socket_(io_context_),
-      local_socket_(io_context_),
-      bytes_to_buffer_(bytes_to_buffer),
-      last_flush_time_(std::chrono::steady_clock::now()),
-      flush_interval_(flush_interval) {
-  buffer_.reserve(bytes_to_buffer_ + 1024);     
+    : SpectatordPublisher(endpoint, PublisherConfig{bytes_to_buffer, flush_interval},
+                          std::move(logger)) {}
+
+SpectatordPublisher::SpectatordPublisher(absl::string_view endpoint, const PublisherConfig& config,
+                                         std::shared_ptr<spdlog::logger> logger)
+    : logger_(std::move(logger)), config_(config) {
+  // Initialize per-CPU buffers using num_seperate_buffers
+  size_t num_buffers = config_.num_seperate_buffers;
+
+  cpu_buffers_.reserve(num_buffers);
+  for (size_t i = 0; i < num_buffers; ++i) {
+    auto buffer = std::make_unique<PerCpuBuffer>();
+    buffer->buffer.reserve(config_.bytes_to_buffer + 1024);
+    buffer->last_flush_time = std::chrono::steady_clock::now();
+    cpu_buffers_.push_back(std::move(buffer));
+  }
+
+  // Initialize socket arrays for worker threads
+  udp_sockets_.reserve(config_.num_worker_threads);
+  local_sockets_.reserve(config_.num_worker_threads);
+  for (size_t i = 0; i < config_.num_worker_threads; ++i) {
+    udp_sockets_.push_back(std::make_unique<asio::ip::udp::socket>(io_context_));
+    local_sockets_.push_back(std::make_unique<asio::local::datagram_protocol::socket>(io_context_));
+  }
+
   if (absl::StartsWith(endpoint, "unix:")) {
     setup_unix_domain(endpoint.substr(5));
   } else if (absl::StartsWith(endpoint, "udp:")) {
     auto pos = 4;
-    // if the user used udp://foo:1234 instead of udp:foo:1234
-    // adjust accordingly
     if (endpoint.substr(pos, 2) == "//") {
       pos += 2;
     }
@@ -34,66 +51,54 @@ SpectatordPublisher::SpectatordPublisher(absl::string_view endpoint,
         std::string(endpoint));
     setup_nop_sender();
   }
+
+  start_worker_threads();
 }
 
-void SpectatordPublisher::setup_nop_sender() {
-  sender_ = [this](std::string_view msg) { logger_->trace("{}", msg); };
+SpectatordPublisher::~SpectatordPublisher() {
+  // Flush all remaining CPU buffers before shutdown
+  for (size_t i = 0; i < cpu_buffers_.size(); ++i) {
+    std::lock_guard<std::mutex> lock(cpu_buffers_[i]->mutex);
+    flush_cpu_buffer(i);
+  }
+
+  stop_worker_threads();
 }
 
-void SpectatordPublisher::local_reconnect(absl::string_view path) {
+void SpectatordPublisher::setup_nop_sender() { endpoint_type_ = EndpointType::DISABLED; }
+
+void SpectatordPublisher::local_reconnect(absl::string_view path, size_t socket_index) {
   using endpoint_t = asio::local::datagram_protocol::endpoint;
   try {
-    if (local_socket_.is_open()) {
-      local_socket_.close();
+    auto& socket = *local_sockets_[socket_index];
+    if (socket.is_open()) {
+      socket.close();
     }
-    local_socket_.open();
-    local_socket_.connect(endpoint_t(std::string(path)));
+    socket.open();
+    socket.connect(endpoint_t(std::string(path)));
   } catch (std::exception& e) {
     logger_->warn("Unable to connect to {}: {}", std::string(path), e.what());
   }
 }
 
 void SpectatordPublisher::setup_unix_domain(absl::string_view path) {
-  local_reconnect(path);
-  // get a copy of the file path
-  std::string local_path{path};
-  sender_ = [local_path, this](std::string_view msg) {
-    buffer_.append(msg);
-    const auto now = std::chrono::steady_clock::now();
-    const bool should_flush = buffer_.length() >= bytes_to_buffer_ ||
-                        now - last_flush_time_ >= flush_interval_;
-
-    if (should_flush) {
-      for (auto i = 0; i < 3; ++i) {
-        try {
-          auto sent_bytes = local_socket_.send(asio::buffer(buffer_));
-          logger_->trace("Sent (local): {} bytes, in total had {}", sent_bytes, buffer_.length());
-          last_flush_time_ = now;
-          break;
-        } catch (std::exception& e) {
-          local_reconnect(local_path);
-          logger_->warn("Unable to send {} - attempt {}/3 ({})", buffer_, i,
-                        e.what());
-        }
-      }
-      buffer_.clear();
-    } else {
-      buffer_.push_back(NEW_LINE);
-    }   
-  };
+  endpoint_type_ = EndpointType::UNIX_DOMAIN;
+  endpoint_path_ = std::string(path);
+  // Initialize all local sockets for worker threads
+  for (size_t i = 0; i < local_sockets_.size(); ++i) {
+    local_reconnect(path, i);
+  }
 }
 
-inline asio::ip::udp::endpoint resolve_host_port(
-    asio::io_context& io_context,  // NOLINT
-    absl::string_view host_port) {
+inline asio::ip::udp::endpoint resolve_host_port(asio::io_context& io_context,  // NOLINT
+                                                 absl::string_view host_port) {
   using asio::ip::udp;
   udp::resolver resolver{io_context};
 
   auto end_host = host_port.find(':');
   if (end_host == std::string_view::npos) {
-    auto err = fmt::format(
-        "Unable to parse udp endpoint: '{}'. Expecting hostname:port",
-        std::string(host_port));
+    auto err = fmt::format("Unable to parse udp endpoint: '{}'. Expecting hostname:port",
+                           std::string(host_port));
     throw std::runtime_error(err);
   }
 
@@ -102,34 +107,174 @@ inline asio::ip::udp::endpoint resolve_host_port(
   return *resolver.resolve(udp::v6(), std::string(host), std::string(port));
 }
 
-void SpectatordPublisher::udp_reconnect(
-    const asio::ip::udp::endpoint& endpoint) {
+void SpectatordPublisher::udp_reconnect(const asio::ip::udp::endpoint& endpoint,
+                                        size_t socket_index) {
   try {
-    if (udp_socket_.is_open()) {
-      udp_socket_.close();
+    auto& socket = *udp_sockets_[socket_index];
+    if (socket.is_open()) {
+      socket.close();
     }
-    udp_socket_.open(asio::ip::udp::v6());
-    udp_socket_.connect(endpoint);
+    socket.open(asio::ip::udp::v6());
+    socket.connect(endpoint);
   } catch (std::exception& e) {
-    logger_->warn("Unable to connect to {}: {}", endpoint.address().to_string(),
-                  endpoint.port());
+    logger_->warn("Unable to connect to {}: {}", endpoint.address().to_string(), endpoint.port());
   }
 }
 
 void SpectatordPublisher::setup_udp(absl::string_view host_port) {
-  auto endpoint = resolve_host_port(io_context_, host_port);
-  udp_reconnect(endpoint);
-  sender_ = [endpoint, this](std::string_view msg) {
-    for (auto i = 0; i < 3; ++i) {
-      try {
-        udp_socket_.send(asio::buffer(msg));
-        logger_->trace("Sent (udp): {}", msg);
-        break;
-      } catch (std::exception& e) {
-        logger_->warn("Unable to send {} - attempt {}/3", msg, i);
-        udp_reconnect(endpoint);
-      }
-    }
-  };
+  endpoint_type_ = EndpointType::UDP;
+  udp_endpoint_ = resolve_host_port(io_context_, host_port);
+  // Initialize all UDP sockets for worker threads
+  for (size_t i = 0; i < udp_sockets_.size(); ++i) {
+    udp_reconnect(udp_endpoint_, i);
+  }
 }
+
+void SpectatordPublisher::send(std::string_view measurement) {
+  if (endpoint_type_ == EndpointType::DISABLED) {
+    logger_->trace("{}", measurement);
+    return;
+  }
+
+  size_t cpu_id = get_cpu_id();
+  auto& cpu_buffer = cpu_buffers_[cpu_id];
+
+  {
+    std::lock_guard<std::mutex> lock(cpu_buffer->mutex);
+
+    // Check if adding this measurement would exceed the max buffer size
+    if (total_buffer_size_.load() + measurement.size() > config_.max_buffer_size) {
+      logger_->warn("Buffer size limit exceeded, dropping measurement");
+      return;
+    }
+
+    cpu_buffer->buffer.append(measurement);
+    cpu_buffer->buffer.push_back(NEW_LINE);
+    total_buffer_size_.fetch_add(measurement.size() + 1);
+
+    const auto now = std::chrono::steady_clock::now();
+    const bool should_flush = cpu_buffer->buffer.length() >= config_.bytes_to_buffer ||
+                              now - cpu_buffer->last_flush_time >= config_.flush_interval;
+
+    if (should_flush) {
+      flush_cpu_buffer(cpu_id);
+    }
+  }
+}
+
+size_t SpectatordPublisher::get_cpu_id() const {
+  int cpu = sched_getcpu();
+  if (cpu < 0) {
+    // Fallback to thread-local storage or simple hash
+    static thread_local size_t tls_cpu_id =
+        std::hash<std::thread::id>{}(std::this_thread::get_id()) % cpu_buffers_.size();
+    return tls_cpu_id;
+  }
+  return static_cast<size_t>(cpu) % cpu_buffers_.size();
+}
+
+void SpectatordPublisher::flush_cpu_buffer(size_t cpu_id) {
+  auto& cpu_buffer = cpu_buffers_[cpu_id];
+
+  if (!cpu_buffer->buffer.empty()) {
+    size_t buffer_size = cpu_buffer->buffer.size();
+
+    // Remove trailing newline for cleaner output
+    if (cpu_buffer->buffer.back() == NEW_LINE) {
+      cpu_buffer->buffer.pop_back();
+    }
+
+    enqueue_work(std::move(cpu_buffer->buffer));
+
+    total_buffer_size_.fetch_sub(buffer_size);
+    cpu_buffer->buffer.clear();
+    cpu_buffer->buffer.reserve(config_.bytes_to_buffer + 1024);
+    cpu_buffer->last_flush_time = std::chrono::steady_clock::now();
+  }
+}
+
+void SpectatordPublisher::enqueue_work(std::string data) {
+  {
+    std::lock_guard<std::mutex> lock(work_queue_mutex_);
+    work_queue_.emplace(WorkItem{std::move(data), std::chrono::steady_clock::now()});
+  }
+  work_cv_.notify_one();
+}
+
+void SpectatordPublisher::start_worker_threads() {
+  if (endpoint_type_ == EndpointType::DISABLED) {
+    return;
+  }
+
+  worker_threads_.reserve(config_.num_worker_threads);
+  for (size_t i = 0; i < config_.num_worker_threads; ++i) {
+    worker_threads_.emplace_back(&SpectatordPublisher::worker_thread_loop, this, i);
+  }
+}
+
+void SpectatordPublisher::stop_worker_threads() {
+  shutdown_requested_.store(true);
+  work_cv_.notify_all();
+
+  for (auto& thread : worker_threads_) {
+    if (thread.joinable()) {
+      thread.join();
+    }
+  }
+  worker_threads_.clear();
+}
+
+void SpectatordPublisher::worker_thread_loop(size_t worker_index) {
+  while (!shutdown_requested_.load()) {
+    std::unique_lock<std::mutex> lock(work_queue_mutex_);
+    work_cv_.wait(lock, [this] { return !work_queue_.empty() || shutdown_requested_.load(); });
+
+    if (shutdown_requested_.load()) {
+      break;
+    }
+
+    if (work_queue_.empty()) {
+      continue;
+    }
+
+    WorkItem item = std::move(work_queue_.front());
+    work_queue_.pop();
+    lock.unlock();
+
+    // Perform the actual socket I/O using worker-specific socket
+    switch (endpoint_type_) {
+      case EndpointType::UNIX_DOMAIN:
+        for (int i = 0; i < 3; ++i) {
+          try {
+            auto& socket = *local_sockets_[worker_index];
+            auto sent_bytes = socket.send(asio::buffer(item.data));
+            logger_->trace("Sent (local): {} bytes", sent_bytes);
+            break;
+          } catch (std::exception& e) {
+            local_reconnect(endpoint_path_, worker_index);
+            logger_->warn("Unable to send data - attempt {}/3 ({})", i + 1, e.what());
+          }
+        }
+        break;
+
+      case EndpointType::UDP:
+        for (int i = 0; i < 3; ++i) {
+          try {
+            auto& socket = *udp_sockets_[worker_index];
+            socket.send(asio::buffer(item.data));
+            logger_->trace("Sent (udp): {} bytes", item.data.size());
+            break;
+          } catch (std::exception& e) {
+            logger_->warn("Unable to send data - attempt {}/3 ({})", i + 1, e.what());
+            udp_reconnect(udp_endpoint_, worker_index);
+          }
+        }
+        break;
+
+      case EndpointType::DISABLED:
+        break;
+    }
+  }
+}
+
 }  // namespace spectator
